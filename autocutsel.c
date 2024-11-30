@@ -30,6 +30,7 @@
  *
  */
 
+#include <iconv.h>
 #include "common.h"
 
 static XrmOptionDescRec optionDesc[] = {
@@ -49,13 +50,15 @@ static XrmOptionDescRec optionDesc[] = {
   {"-pause",     "pause",     XrmoptionSepArg, NULL},
   {"-p",         "pause",     XrmoptionSepArg, NULL},
   {"-buttonup",  "buttonup",  XrmoptionNoArg,  "on"},
+  {"-encoding",  "encoding",  XrmoptionSepArg,  NULL},
+  {"-e",         "encoding",  XrmoptionSepArg,  NULL},
 };
 
 int Syntax(char *call)
 {
   fprintf (stderr,
     "usage:  %s [-selection <name>] [-cutbuffer <number>]"
-    " [-pause <milliseconds>] [-debug] [-verbose] [-fork] [-buttonup]\n",
+    " [-pause <milliseconds>] [-debug] [-verbose] [-fork] [-buttonup] [-encoding]\n",
     call);
   exit (1);
 }
@@ -79,6 +82,8 @@ static XtResource resources[] = {
     Offset(pause), XtRImmediate, (XtPointer)500},
   {"buttonup", "ButtonUp", XtRString, sizeof(String),
     Offset(buttonup_option), XtRString, "off"},
+  {"encoding", "Encoding", XtRString, sizeof(String),
+          Offset(encoding), XtRString, NULL},
 };
 
 #undef Offset
@@ -119,33 +124,113 @@ static void LoseSelection(Widget w, Atom *selection)
   options.own_selection = 0;
 }
 
+static int ConvertEncoding (char* from_encoding, char* to_encoding, const char *input, size_t input_len, char** output, int *output_len)
+{
+    iconv_t cd = iconv_open(to_encoding, from_encoding);
+    if (cd == (iconv_t)-1) {
+        printf("iconv_open: %s", strerror(errno));
+        return -1;
+    }
+    int status = 0;
+    const char* in_ptr = input;
+    int out_buf_size = input_len * 1.5;
+    char *out_buf = XtMalloc(out_buf_size);
+    int out_buf_offset = 0;
+    size_t in_size = input_len;
+    char* out_buf_new_tmp;
+    while (in_size > 0) {
+        char* out_ptr = out_buf + out_buf_offset;
+        size_t outsize = out_buf_size - out_buf_offset;
+        size_t res = iconv(cd, (char**)&in_ptr, &in_size, &out_ptr, &outsize);
+        if (out_ptr != out_buf) {
+            int saved_errno = errno;
+            out_buf_offset = out_ptr - out_buf;
+            errno = saved_errno;
+        }
+        if (res == (size_t)(-1)) {
+            if (errno == E2BIG) {
+                out_buf_size += 1024;
+                if (out_buf_size==0) /* integer overflow? */
+                {
+                    status = 1;
+                    goto done;
+                }
+                out_buf_new_tmp = XtMalloc(out_buf_size);
+                memcpy(out_buf_new_tmp, out_buf, out_buf_offset);
+                XtFree(out_buf);
+                out_buf = out_buf_new_tmp;
+            } else {
+                printf("convert %s to %s occur error: %s\n", from_encoding, to_encoding, strerror(errno));
+                status = 1;
+                goto done;
+            }
+        }
+    }
+    done:
+    if(status) {
+        XtFree(out_buf);
+    } else {
+        *output = out_buf;
+        *output_len = out_buf_offset;
+    }
+    if(iconv_close(cd)) {
+        printf("iconv_close occur error: %s\n", strerror(errno));
+    }
+    return status;
+}
+
 // Returns true if value (or length) is different
 // than current ones.
 static int ValueDiffers(char *value, int length)
 {
-  return (!options.value ||
-    length != options.length ||
-    memcmp(options.value, value, options.length));
+    if(options.encoding && options.org_value) {
+        return (length != options.org_length || memcmp(options.org_value, value, options.org_length));
+    }
+    return (!options.value || length != options.length || memcmp(options.value, value, options.length));
 }
 
 // Update the current value
-static void ChangeValue(char *value, int length)
+static void ChangeValue(int from_client, char *value, int length)
 {
-  if (options.value)
-    XtFree(options.value);
-
+  if (options.value) {
+      XtFree(options.value);
+      options.value = NULL;
+  }
+  if (options.org_value) {
+      XtFree(options.org_value);
+      options.org_value = NULL;
+  }
+  if(options.encoding) {
+      int ret;
+      if(from_client) {
+          ret = ConvertEncoding(options.encoding, "UTF8", value, length, &options.value, &options.length);
+      } else {
+          ret = ConvertEncoding("UTF8", options.encoding, value, length, &options.value, &options.length);
+      }
+      if(!ret) {
+          options.org_value = XtMalloc(length);
+          memcpy(options.org_value, value, length);
+          options.org_length = length;
+          if (options.debug) {
+              printf("New value saved: ");
+              PrintValue(options.value, options.length);
+              printf("\n");
+          }
+          return;
+      }
+  }
   options.length = length;
   options.value = XtMalloc(options.length);
   if (!options.value)
-    printf("WARNING: Unable to allocate memory to store the new value\n");
+      printf("WARNING: Unable to allocate memory to store the new value\n");
   else {
-    memcpy(options.value, value, options.length);
+      memcpy(options.value, value, options.length);
 
-    if (options.debug) {
-      printf("New value saved: ");
-      PrintValue(options.value, options.length);
-      printf("\n");
-    }
+      if (options.debug) {
+          printf("New value saved: ");
+          PrintValue(options.value, options.length);
+          printf("\n");
+      }
   }
 }
 
@@ -199,7 +284,7 @@ static void CheckBuffer()
       printf("\n");
     }
 
-    ChangeValue(value, length);
+    ChangeValue(1, value, length);
     XtGetSelectionValue(box, selection, XInternAtom(dpy, "UTF8_STRING", False),
       OwnSelectionIfDiffers, NULL,
       CurrentTime);
@@ -223,7 +308,7 @@ static void SelectionReceived(Widget w, XtPointer client_data, Atom *selection,
         printf("\n");
       }
 
-      ChangeValue((char*)value, length);
+      ChangeValue(0, (char*)value, length);
       if (options.verbose) {
         printf("sel -> cut: ");
         PrintValue(options.value, options.length);
@@ -351,7 +436,6 @@ int main(int argc, char* argv[])
   buffer = 0;
 
   options.value = XFetchBuffer(dpy, &options.length, buffer);
-
   XtAppAddTimeOut(context, options.pause, timeout, 0);
   XtRealizeWidget(top);
   XUnmapWindow(XtDisplay(top), XtWindow(top));

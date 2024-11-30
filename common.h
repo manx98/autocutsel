@@ -60,8 +60,11 @@ typedef struct {
   Atom    selection;
   char*   value;
   int     length;
+  char*   org_value;
+  int     org_length;
   int     own_selection;
   int     buttonup;
+  char*   encoding;
 } OptionsRec;
 
 extern Widget box;
